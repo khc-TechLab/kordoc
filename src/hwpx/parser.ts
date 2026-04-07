@@ -7,7 +7,7 @@
 import JSZip from "jszip"
 import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
-import { buildTable, convertTableToText, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
+import { buildTable, blocksToMarkdown, flattenLayoutTables, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle, ExtractedImage } from "../types.js"
 import { HEADING_RATIO_H1, HEADING_RATIO_H2, HEADING_RATIO_H3 } from "../types.js"
 import { KordocError, isPathTraversal, sanitizeHref, precheckZipSize } from "../utils.js"
@@ -29,6 +29,38 @@ function clampSpan(val: number, max: number): number {
 const MAX_XML_DEPTH = 200
 
 interface TableState { rows: CellContext[][]; currentRow: CellContext[]; cell: CellContext | null }
+const EMBEDDED_BLOCK_TOKEN_PREFIX = "[[KORDOC_BLOCK_"
+
+function embedBlockIntoCell(cell: CellContext, block: IRBlock): void {
+  const embeddedBlocks = cell.embeddedBlocks ?? (cell.embeddedBlocks = [])
+  const index = embeddedBlocks.push(block) - 1
+  cell.text += (cell.text ? "\n" : "") + `${EMBEDDED_BLOCK_TOKEN_PREFIX}${index}]]`
+}
+
+function finalizeTableBlock(
+  newTable: TableState,
+  blocks: IRBlock[],
+  tableStack: TableState[],
+  sectionNum?: number
+): TableState | null {
+  if (newTable.rows.length === 0) {
+    return tableStack.length > 0 ? tableStack.pop()! : null
+  }
+
+  const tableBlock: IRBlock = { type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum }
+  if (tableStack.length > 0) {
+    const parentTable = tableStack.pop()!
+    if (parentTable.cell) {
+      embedBlockIntoCell(parentTable.cell, tableBlock)
+    } else {
+      blocks.push(tableBlock)
+    }
+    return parentTable
+  }
+
+  blocks.push(tableBlock)
+  return null
+}
 
 /** xmldom DOMParser 생성 — onError 콜백으로 malformed XML 경고 수집 */
 function createXmlParser(warnings?: ParseWarning[]): DOMParser {
@@ -205,16 +237,19 @@ export async function parseHwpxDocument(buffer: ArrayBuffer, options?: ParseOpti
   // 이미지 블록에서 ZIP 바이너리 추출
   const images = await extractImagesFromZip(zip, blocks, decompressed, warnings)
 
+  // 레이아웃/래퍼 테이블 해체 (HWP5와 동일한 후처리)
+  const flatBlocks = flattenLayoutTables(blocks)
+
   // 스타일 기반 헤딩 감지
-  detectHwpxHeadings(blocks, styleMap)
+  detectHwpxHeadings(flatBlocks, styleMap)
 
   // outline 구축
-  const outline: OutlineItem[] = blocks
+  const outline: OutlineItem[] = flatBlocks
     .filter(b => b.type === "heading" && b.level && b.text)
     .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
 
-  const markdown = blocksToMarkdown(blocks)
-  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined, images: images.length > 0 ? images : undefined }
+  const markdown = blocksToMarkdown(flatBlocks)
+  return { markdown, blocks: flatBlocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined, images: images.length > 0 ? images : undefined }
 }
 
 // ─── 이미지 추출 ───────────────────────────────────
@@ -608,28 +643,7 @@ function walkSection(
         if (tableCtx) tableStack.push(tableCtx)
         const newTable: TableState = { rows: [], currentRow: [], cell: null }
         walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum, depth + 1)
-
-        if (newTable.rows.length > 0) {
-          if (tableStack.length > 0) {
-            const parentTable = tableStack.pop()!
-            // 중첩 표가 충분히 크면 (3행+, 2열+) 별도 블록으로 분리
-            const nestedCols = Math.max(...newTable.rows.map(r => r.length))
-            if (newTable.rows.length >= 3 && nestedCols >= 2) {
-              blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
-            } else {
-              const nestedText = convertTableToText(newTable.rows)
-              if (parentTable.cell) {
-                parentTable.cell.text += (parentTable.cell.text ? "\n" : "") + nestedText
-              }
-            }
-            tableCtx = parentTable
-          } else {
-            blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
-            tableCtx = null
-          }
-        } else {
-          tableCtx = tableStack.length > 0 ? tableStack.pop()! : null
-        }
+        tableCtx = finalizeTableBlock(newTable, blocks, tableStack, sectionNum)
         break
       }
 
@@ -733,26 +747,7 @@ function walkParagraphChildren(
         if (tableCtx) tableStack.push(tableCtx)
         const newTable: TableState = { rows: [], currentRow: [], cell: null }
         walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum, d + 1)
-        if (newTable.rows.length > 0) {
-          if (tableStack.length > 0) {
-            const parentTable = tableStack.pop()!
-            const nestedCols = Math.max(...newTable.rows.map(r => r.length))
-            if (newTable.rows.length >= 3 && nestedCols >= 2) {
-              blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
-            } else {
-              const nestedText = convertTableToText(newTable.rows)
-              if (parentTable.cell) {
-                parentTable.cell.text += (parentTable.cell.text ? "\n" : "") + nestedText
-              }
-            }
-            tableCtx = parentTable
-          } else {
-            blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
-            tableCtx = null
-          }
-        } else {
-          tableCtx = tableStack.length > 0 ? tableStack.pop()! : null
-        }
+        tableCtx = finalizeTableBlock(newTable, blocks, tableStack, sectionNum)
       } else if (localTag === "pic" || localTag === "shape" || localTag === "drawingObject") {
         // 도형/이미지 안에 drawText(글상자)가 있으면 텍스트 추출 우선
         const drawTextChild = findDescendant(el, "drawText")

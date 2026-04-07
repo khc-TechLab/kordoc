@@ -115,6 +115,159 @@ describe("구조화 파싱: blocks", () => {
     }
   })
 
+  it("중첩 HWPX 테이블 → 래퍼 테이블 해체 + 내부 표 순서 보존", async () => {
+    const xml = wrapSectionXml(`
+      <hp:tbl>
+        <hp:tr>
+          <hp:tc>
+            <hp:cellSpan colSpan="1" rowSpan="1" />
+            <hp:subList>
+              <hp:p><hp:run><hp:t>질의</hp:t></hp:run></hp:p>
+              <hp:tbl>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>항목</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>내용</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>A</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>B</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+              </hp:tbl>
+              <hp:p><hp:run><hp:t>답변</hp:t></hp:run></hp:p>
+            </hp:subList>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    `)
+    const buf = await makeHwpxZip([{ name: "section0.xml", xml }])
+    const result = await parse(buf)
+
+    assert.equal(result.success, true)
+    if (result.success) {
+      assert.deepEqual(result.blocks.map(b => b.type), ["paragraph", "table", "paragraph"])
+      assert.equal(result.blocks[0].text, "질의")
+      assert.equal(result.blocks[2].text, "답변")
+
+      const table = result.blocks[1].table
+      assert.ok(table, "내부 표 존재")
+      assert.equal(table!.rows, 2)
+      assert.equal(table!.cols, 2)
+      assert.equal(table!.cells[0][0].text, "항목")
+      assert.equal(table!.cells[1][1].text, "B")
+
+      const qIndex = result.markdown.indexOf("질의")
+      const tableIndex = result.markdown.indexOf("| 항목 | 내용 |")
+      const aIndex = result.markdown.indexOf("답변")
+      assert.ok(qIndex >= 0 && tableIndex > qIndex && aIndex > tableIndex, "문단 → 표 → 문단 순서 유지")
+    }
+  })
+
+  it("중첩 행이 있는 HWPX 표 → 바깥 표 유지 + 내부 표는 셀 텍스트로 평탄화", async () => {
+    const xml = wrapSectionXml(`
+      <hp:tbl>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>연번</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>질의</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>답변</hp:t></hp:run></hp:p></hp:tc>
+        </hp:tr>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>1</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>일반 질의</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>일반 답변</hp:t></hp:run></hp:p></hp:tc>
+        </hp:tr>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>2</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>중첩 질의</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc>
+            <hp:cellSpan colSpan="1" rowSpan="1" />
+            <hp:subList>
+              <hp:p><hp:run><hp:t>서두</hp:t></hp:run></hp:p>
+              <hp:tbl>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>항목</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>내용</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>A</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>B</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+              </hp:tbl>
+              <hp:p><hp:run><hp:t>말미</hp:t></hp:run></hp:p>
+            </hp:subList>
+          </hp:tc>
+        </hp:tr>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>3</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>후속 질의</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>후속 답변</hp:t></hp:run></hp:p></hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    `)
+    const buf = await makeHwpxZip([{ name: "section0.xml", xml }])
+    const result = await parse(buf)
+
+    assert.equal(result.success, true)
+    if (result.success) {
+      const tables = result.blocks.filter(b => b.type === "table")
+      assert.equal(tables.length, 1, "바깥 표 하나만 유지")
+      assert.equal(tables[0].table?.rows, 4)
+      assert.equal(tables[0].table?.cols, 3)
+
+      const paragraphs = result.blocks.filter(b => b.type === "paragraph").map(b => b.text)
+      assert.ok(!paragraphs.includes("연번: 2"))
+      assert.ok(!paragraphs.includes("질의: 중첩 질의"))
+      assert.ok(!paragraphs.includes("답변: 서두"))
+
+      const answerCell = tables[0].table?.cells?.[2]?.[2]
+      assert.ok(answerCell, "중첩 답변 셀 존재")
+      assert.equal(answerCell?.embeddedBlocks?.length, 1, "내부 표는 셀에 귀속")
+
+      assert.ok(result.markdown.includes("| 2 | 중첩 질의 | 서두<br>항목: A / 내용: B<br>말미 |"))
+      assert.ok(!result.markdown.includes("연번: 2"))
+      assert.ok(!result.markdown.includes("| 항목 | 내용 |"))
+    }
+  })
+
+  it("번호형 2열 nested table → 래퍼 표에서는 자연스러운 번호 표로 유지", async () => {
+    const xml = wrapSectionXml(`
+      <hp:tbl>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>질의</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>답변</hp:t></hp:run></hp:p></hp:tc>
+        </hp:tr>
+        <hp:tr>
+          <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>정의는?</hp:t></hp:run></hp:p></hp:tc>
+          <hp:tc>
+            <hp:cellSpan colSpan="1" rowSpan="1" />
+            <hp:subList>
+              <hp:p><hp:run><hp:t>기준은 아래와 같음</hp:t></hp:run></hp:p>
+              <hp:tbl>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>1.</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>첫 기준</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+                <hp:tr>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>2.</hp:t></hp:run></hp:p></hp:tc>
+                  <hp:tc><hp:cellSpan colSpan="1" rowSpan="1" /><hp:p><hp:run><hp:t>둘째 기준</hp:t></hp:run></hp:p></hp:tc>
+                </hp:tr>
+              </hp:tbl>
+            </hp:subList>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    `)
+    const buf = await makeHwpxZip([{ name: "section0.xml", xml }])
+    const result = await parse(buf)
+
+    assert.equal(result.success, true)
+    if (result.success) {
+      assert.ok(result.markdown.includes("기준은 아래와 같음"))
+      assert.ok(result.markdown.includes("| 1. | 첫 기준 |"))
+      assert.ok(result.markdown.includes("| 2. | 둘째 기준 |"))
+      assert.ok(!result.markdown.includes("1.: 2."))
+    }
+  })
+
   it("빈 버퍼 → blocks 없음 (실패 결과)", async () => {
     const result = await parse(new ArrayBuffer(0))
     assert.equal(result.success, false)

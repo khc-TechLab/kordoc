@@ -7,6 +7,7 @@ import { sanitizeHref } from "../utils.js"
 export const MAX_COLS = 200
 /** 테이블 행 수 상한 — 메모리 폭주 방지 */
 export const MAX_ROWS = 10000
+const EMBEDDED_BLOCK_TOKEN_RE = /\[\[KORDOC_BLOCK_(\d+)\]\]/g
 
 export function buildTable(rows: CellContext[][]): IRTable {
   if (rows.length > MAX_ROWS) rows = rows.slice(0, MAX_ROWS)
@@ -57,6 +58,7 @@ export function buildTable(rows: CellContext[][]): IRTable {
         text: cell.text.trim(),
         colSpan: cell.colSpan,
         rowSpan: cell.rowSpan,
+        embeddedBlocks: cell.embeddedBlocks,
       }
 
       for (let r = rowIdx; r < Math.min(rowIdx + cell.rowSpan, numRows); r++) {
@@ -95,7 +97,7 @@ function buildTableDirect(rows: CellContext[][], numRows: number): IRTable {
       const c = cell.colAddr ?? 0
       if (r >= numRows || c >= maxCols) continue
 
-      grid[r][c] = { text: cell.text.trim(), colSpan: cell.colSpan, rowSpan: cell.rowSpan }
+      grid[r][c] = { text: cell.text.trim(), colSpan: cell.colSpan, rowSpan: cell.rowSpan, embeddedBlocks: cell.embeddedBlocks }
 
       // 병합 영역 마킹
       for (let dr = 0; dr < cell.rowSpan; dr++) {
@@ -139,6 +141,129 @@ export function convertTableToText(rows: CellContext[][]): string {
     .join("\n")
 }
 
+function tableToDisplayRows(table: IRTable): string[][] {
+  const display: string[][] = Array.from({ length: table.rows }, () => Array(table.cols).fill(""))
+  const skip = new Set<string>()
+
+  for (let r = 0; r < table.rows; r++) {
+    for (let c = 0; c < table.cols; c++) {
+      if (skip.has(`${r},${c}`)) continue
+      const cell = table.cells[r]?.[c]
+      if (!cell) continue
+      display[r][c] = renderCellText(cell).replace(/\n/g, " ").trim()
+      for (let dr = 0; dr < cell.rowSpan; dr++) {
+        for (let dc = 0; dc < cell.colSpan; dc++) {
+          if (dr === 0 && dc === 0) continue
+          if (r + dr < table.rows && c + dc < table.cols) {
+            skip.add(`${r + dr},${c + dc}`)
+          }
+        }
+      }
+    }
+  }
+
+  return display
+    .map(row => row.map(cell => cell.trim()))
+    .filter(row => row.some(Boolean))
+}
+
+function isEnumeratorCell(text: string): boolean {
+  return /^\d+[.)]?$/.test(text) || /^[가-힣]\.$/.test(text) || /^[ivxlcdm]+[.)]?$/i.test(text)
+}
+
+function looksLikeHeaderRow(row: string[]): boolean {
+  const values = row.filter(Boolean)
+  if (values.length === 0) return false
+  if (values.some(isEnumeratorCell)) return false
+  if (values.some(value => value.length > 20)) return false
+  return true
+}
+
+function tableToInlineText(table: IRTable): string {
+  const rows = tableToDisplayRows(table)
+  if (rows.length === 0) return ""
+
+  const hasHeader = table.hasHeader && rows.length >= 2 && looksLikeHeaderRow(rows[0])
+  if (!hasHeader) {
+    return rows
+      .map(row => {
+        if (row.length >= 2 && isEnumeratorCell(row[0]) && row[1]) {
+          const rest = row.slice(2).filter(Boolean)
+          return [ `${row[0]} ${row[1]}`, ...rest ].join(" / ")
+        }
+        return row.filter(Boolean).join(" / ")
+      })
+      .filter(Boolean)
+      .join("\n")
+  }
+
+  const header = rows[0]
+  return rows
+    .slice(1)
+    .map(row =>
+      row
+        .map((value, index) => {
+          if (!value) return ""
+          const label = header[index]
+          return label ? `${label}: ${value}` : value
+        })
+        .filter(Boolean)
+        .join(" / ")
+    )
+    .filter(Boolean)
+    .join("\n")
+}
+
+function renderEmbeddedBlockText(block: IRBlock): string {
+  if (block.type === "table" && block.table) return tableToInlineText(block.table)
+  if ((block.type === "paragraph" || block.type === "heading" || block.type === "list") && block.text) return sanitizeText(block.text)
+  return ""
+}
+
+function resolveEmbeddedBlocks(text: string, embeddedBlocks?: IRBlock[]): string {
+  if (!embeddedBlocks || embeddedBlocks.length === 0) return text.replace(EMBEDDED_BLOCK_TOKEN_RE, "")
+  return text.replace(EMBEDDED_BLOCK_TOKEN_RE, (_match, indexText) => {
+    const index = parseInt(indexText, 10)
+    const block = embeddedBlocks[index]
+    return block ? renderEmbeddedBlockText(block) : ""
+  })
+}
+
+function renderCellText(cell?: IRCell): string {
+  if (!cell) return ""
+  return sanitizeText(resolveEmbeddedBlocks(cell.text, cell.embeddedBlocks))
+}
+
+function expandLayoutCell(cell: IRCell | undefined, pageNumber?: number): IRBlock[] {
+  if (!cell) return []
+
+  const blocks: IRBlock[] = []
+  const text = cell.text || ""
+  const embeddedBlocks = cell.embeddedBlocks || []
+  let lastIndex = 0
+  EMBEDDED_BLOCK_TOKEN_RE.lastIndex = 0
+
+  const pushParagraphs = (chunk: string) => {
+    const resolved = resolveEmbeddedBlocks(chunk, embeddedBlocks)
+    for (const line of resolved.split("\n")) {
+      const trimmed = sanitizeText(line)
+      if (!trimmed) continue
+      blocks.push({ type: "paragraph", text: trimmed, pageNumber })
+    }
+  }
+
+  for (const match of text.matchAll(EMBEDDED_BLOCK_TOKEN_RE)) {
+    pushParagraphs(text.slice(lastIndex, match.index))
+    const index = parseInt(match[1], 10)
+    const block = embeddedBlocks[index]
+    if (block) blocks.push(block)
+    lastIndex = (match.index ?? 0) + match[0].length
+  }
+
+  pushParagraphs(text.slice(lastIndex))
+  return blocks
+}
+
 /** HWP 자동생성 도형/개체 대체텍스트 정규식 — 한컴오피스가 삽입하는 모든 알려진 패턴 */
 const HWP_SHAPE_ALT_TEXT_RE = /(?:모서리가 둥근 |둥근 )?(?:사각형|직사각형|정사각형|원|타원|삼각형|이등변 삼각형|직각 삼각형|선|직선|곡선|화살표|굵은 화살표|이중 화살표|오각형|육각형|팔각형|별|[4-8]점별|십자|십자형|구름|구름형|마름모|도넛|평행사변형|사다리꼴|부채꼴|호|반원|물결|번개|하트|빗금|블록 화살표|수식|표|그림|개체|그리기\s?개체|묶음\s?개체|글상자|수식\s?개체|OLE\s?개체)\s?입니다\.?/g
 
@@ -179,42 +304,39 @@ export function flattenLayoutTables(blocks: IRBlock[]): IRBlock[] {
     }
 
     const { rows: numRows, cols: numCols, cells } = block.table
+    const hasEmbeddedBlocks = cells.some(row => row.some(cell => (cell?.embeddedBlocks?.length || 0) > 0))
 
     // 1x1 테이블은 기존 로직(tableToMarkdown)에서 처리
-    if (numRows === 1 && numCols === 1) {
+    if (numRows === 1 && numCols === 1 && !hasEmbeddedBlocks) {
       result.push(block)
       continue
     }
 
+    let shouldFlatten = hasEmbeddedBlocks && numRows <= 3
+
     // 레이아웃 테이블 휴리스틱
-    if (numRows <= 3) {
+    if (!shouldFlatten && numRows <= 3) {
       let totalNewlines = 0
       let totalTextLen = 0
       for (let r = 0; r < numRows; r++) {
         for (let c = 0; c < numCols; c++) {
-          const t = cells[r]?.[c]?.text || ""
+          const t = resolveEmbeddedBlocks(cells[r]?.[c]?.text || "", cells[r]?.[c]?.embeddedBlocks)
           totalNewlines += (t.match(/\n/g) || []).length
           totalTextLen += t.length
         }
       }
 
       // 레이아웃 테이블 판정: 많은 줄바꿈(>5), 또는 적은 행에 비해 총 텍스트 과다(>300)
-      if (totalNewlines > 5 || (numRows <= 2 && totalTextLen > 300)) {
-        // 레이아웃 테이블 → 각 셀을 paragraph 블록으로 분해
-        for (let r = 0; r < numRows; r++) {
-          for (let c = 0; c < numCols; c++) {
-            const cellText = cells[r]?.[c]?.text?.trim()
-            if (!cellText) continue
-            // 셀 내 줄바꿈을 별도 paragraph로 분리
-            for (const line of cellText.split("\n")) {
-              const trimmed = line.trim()
-              if (!trimmed) continue
-              result.push({ type: "paragraph", text: trimmed, pageNumber: block.pageNumber })
-            }
-          }
+      shouldFlatten = totalNewlines > 5 || (numRows <= 2 && totalTextLen > 300)
+    }
+
+    if (shouldFlatten) {
+      for (let r = 0; r < numRows; r++) {
+        for (let c = 0; c < numCols; c++) {
+          result.push(...expandLayoutCell(cells[r]?.[c], block.pageNumber))
         }
-        continue
       }
+      continue
     }
 
     result.push(block)
@@ -322,7 +444,7 @@ function tableToMarkdown(table: IRTable): string {
 
   // 1행 1열 → 구조화된 텍스트 (빈 셀이면 스킵)
   if (numRows === 1 && numCols === 1) {
-    const content = sanitizeText(cells[0][0].text)
+    const content = renderCellText(cells[0][0])
     if (!content) return ""
     return content
       .split(/\n/)
@@ -340,7 +462,7 @@ function tableToMarkdown(table: IRTable): string {
   // 1열 다행 테이블 → 각 행을 별도 라인으로 출력 (목록성 데이터)
   if (numCols === 1 && numRows >= 2) {
     return cells
-      .map(row => sanitizeText(row[0].text).replace(/\n/g, " "))
+      .map(row => renderCellText(row[0]).replace(/\n/g, " "))
       .filter(Boolean)
       .join("\n")
   }
@@ -354,7 +476,7 @@ function tableToMarkdown(table: IRTable): string {
       if (skip.has(`${r},${c}`)) continue
       const cell = cells[r]?.[c]
       if (!cell) continue
-      display[r][c] = sanitizeText(cell.text).replace(/\n/g, "<br>")
+      display[r][c] = renderCellText(cell).replace(/\n/g, "<br>")
 
       for (let dr = 0; dr < cell.rowSpan; dr++) {
         for (let dc = 0; dc < cell.colSpan; dc++) {

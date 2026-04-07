@@ -6,6 +6,8 @@ export interface CellContext {
   text: string
   colSpan: number
   rowSpan: number
+  /** 셀 내부에서 발견한 구조 블록(예: 중첩 표) — 레이아웃 테이블 해체용 */
+  embeddedBlocks?: IRBlock[]
   /** HWP5 셀 열 주소 (0-based) — 병합 테이블 배치용 */
   colAddr?: number
   /** HWP5 셀 행 주소 (0-based) — 병합 테이블 배치용 */
@@ -78,6 +80,8 @@ export interface IRCell {
   text: string
   colSpan: number
   rowSpan: number
+  /** 셀 내부의 중첩 구조 블록(예: 중첩 표) */
+  embeddedBlocks?: IRBlock[]
 }
 
 // ─── 메타데이터 ─────────────────────────────────────
